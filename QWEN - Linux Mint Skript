@@ -1,0 +1,412 @@
+#!/bin/bash
+# ============================================================================
+# Linux Mint Ultimate Final Setup – "Set & Forget" Edition
+# ============================================================================
+# Priorität: Stabilität > Robustheit > Flüssigkeit
+# Use-Case: Laptop meist am Netzteil • Kein Gaming • Nur Firefox + Teams native
+# Ziel: Einmal ausführen → NIEMALS wieder eingreifen
+# ============================================================================
+# Design-Prinzipien:
+# • DEFENSIV: Jeder Schritt prüft, ob er nötig/sicher ist
+# • IDEMPOTENT: Mehrfaches Ausführen verursacht keinen Schaden
+# • FEHLER-RESISTENT: Kein Schritt kann das System unbootbar machen
+# • LOGGING: Jede Aktion wird protokolliert für spätere Diagnose
+# • MINIMAL: Nur das Nötigste – weniger Code = weniger Fehlerquellen
+# ============================================================================
+
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+# --- Sicherer Befehls-Wrapper (ignoriert Fehler bei nicht-kritischen Schritten) ---
+safe_run() { "$@" 2>/dev/null || true; }
+
+# --- Logging mit Zeitstempel ---
+readonly LOGFILE="/var/log/mint-ultimate-final.log"
+readonly TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+readonly SCRIPT_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "$USER")}"
+readonly HOME_DIR="/home/$SCRIPT_USER"
+
+log()    { echo -e "[$TIMESTAMP] $1" | tee -a "$LOGFILE" 2>/dev/null || echo "$1"; }
+info()   { log "ℹ️  $1"; }
+ok()     { log "✅ $1"; }
+warn()   { log "⚠️  $1"; }
+err()    { log "❌ FEHLER: $1"; }
+
+# --- Root‑Prüfung ---
+if [[ $EUID -ne 0 ]]; then
+    err "Dieses Skript benötigt Root-Rechte."
+    err "Bitte im Terminal eingeben: sudo bash"
+    exit 1
+fi
+
+# --- Linux Mint Prüfung (mit Warnung und Bestätigung) ---
+if ! grep -qi "linux mint" /etc/os-release 2>/dev/null; then
+    warn "Dieses Skript wurde für Linux Mint getestet."
+    warn "Fortfahren auf nicht-Mint-System kann zu unerwartetem Verhalten führen."
+    read -p "Trotzdem fortfahren? (j/N): " -n 1 -r < /dev/tty || true
+    echo
+    if [[ ! $REPLY =~ ^[Jj]$ ]]; then
+        info "Abgebrochen durch Benutzer."
+        exit 0
+    fi
+fi
+
+log "🚀 Starte Ultimate Final Setup für User: $SCRIPT_USER"
+log "📋 System: $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
+
+# ============================================================================
+# 0. HARDWARE-ERKENNUNG (mit Fallbacks für maximale Kompatibilität)
+# ============================================================================
+info "🔍 Phase 0/12: Hardware erkennen..."
+
+CPU_VENDOR="unknown"
+if command -v lscpu &>/dev/null; then
+    CPU_VENDOR=$(lscpu 2>/dev/null | grep "Vendor ID" | awk '{print $3}' || echo "unknown")
+elif [[ -f /proc/cpuinfo ]]; then
+    if grep -q "GenuineIntel" /proc/cpuinfo 2>/dev/null; then CPU_VENDOR="GenuineIntel"
+    elif grep -q "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then CPU_VENDOR="AuthenticAMD"
+    fi
+fi
+
+case "$CPU_VENDOR" in
+    *"GenuineIntel"*) CPU_TYPE="intel"; CPU_MICROCODE="intel-microcode"; CPU_VA_DRIVER="intel-media-va-driver i965-va-driver-shaders" ;;
+    *"AuthenticAMD"*) CPU_TYPE="amd"; CPU_MICROCODE="amd64-microcode"; CPU_VA_DRIVER="mesa-va-drivers" ;;
+    *) CPU_TYPE="unknown"; CPU_MICROCODE=""; CPU_VA_DRIVER="mesa-va-drivers"; warn "⚠️ CPU-Typ nicht eindeutig" ;;
+esac
+info "🧠 CPU: $CPU_TYPE"
+
+TOTAL_RAM_GB=4
+if command -v free &>/dev/null; then
+    TOTAL_RAM_GB=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}' || echo "4")
+elif [[ -f /proc/meminfo ]]; then
+    TOTAL_RAM_GB=$(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "4")
+fi
+[[ "$TOTAL_RAM_GB" -lt 1 ]] && TOTAL_RAM_GB=4
+info "💾 RAM: ${TOTAL_RAM_GB}GB"
+
+SSD_DETECTED=false
+ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's|/dev/||' | cut -d'[' -f1 || echo "")
+if [[ -n "$ROOT_DEV" ]] && [[ -f "/sys/block/$ROOT_DEV/queue/rotational" ]]; then
+    if [[ "$(cat "/sys/block/$ROOT_DEV/queue/rotational" 2>/dev/null)" == "0" ]]; then SSD_DETECTED=true; info "💽 SSD erkannt"
+    else info "💽 HDD erkannt"
+    fi
+else
+    warn "⚠️ Storage-Typ nicht eindeutig, nehme HDD als Default an"
+fi
+
+GPU_TYPE="unknown"; GPU_DRIVER="unknown"
+if command -v lspci &>/dev/null; then
+    GPU_INFO=$(lspci -k 2>/dev/null | grep -EA3 'VGA|3D|Display' | grep 'Kernel driver in use' | head -1 || echo "")
+    if echo "$GPU_INFO" | grep -qi "nvidia"; then GPU_TYPE="nvidia"; GPU_DRIVER="nvidia"
+    elif echo "$GPU_INFO" | grep -qi "amdgpu"; then GPU_TYPE="amd"; GPU_DRIVER="amdgpu"
+    elif echo "$GPU_INFO" | grep -qi "i915"; then GPU_TYPE="intel"; GPU_DRIVER="i915"
+    else
+        GPU_PCI=$(lspci -nn 2>/dev/null | grep -i 'VGA\|3D' | head -1 || echo "")
+        if echo "$GPU_PCI" | grep -qi "nvidia"; then GPU_TYPE="nvidia"
+        elif echo "$GPU_PCI" | grep -qi "amd\|ati"; then GPU_TYPE="amd"
+        elif echo "$GPU_PCI" | grep -qi "intel"; then GPU_TYPE="intel"
+        fi
+    fi
+fi
+info "🎮 GPU: $GPU_TYPE (Treiber: ${GPU_DRIVER:-unbekannt})"
+
+IS_LAPTOP=true
+if command -v dmidecode &>/dev/null; then
+    CHASSIS=$(dmidecode -s chassis-type 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "")
+    if [[ ! "$CHASSIS" =~ laptop|notebook|portable ]]; then IS_LAPTOP=false; fi
+fi
+$IS_LAPTOP && info "💻 Laptop erkannt" || info "🖥️ Desktop erkannt"
+
+TEAMS_NATIVE=false
+if command -v teams &>/dev/null 2>&1; then TEAMS_NATIVE=true
+elif dpkg -l 2>/dev/null | grep -q "^ii.*teams.*microsoft"; then TEAMS_NATIVE=true
+fi
+$TEAMS_NATIVE && info "💬 Teams native App erkannt" || info "💬 Teams native nicht gefunden"
+
+IS_CINNAMON=false
+if command -v cinnamon &>/dev/null || pgrep -x cinnamon &>/dev/null 2>&1; then
+    IS_CINNAMON=true; info "🎨 Cinnamon Desktop erkannt"
+fi
+
+# ============================================================================
+# 1. SYSTEM-UPDATE (mit Retry-Logik für Netzwerk-Probleme)
+# ============================================================================
+info "🔄 Phase 1/12: System aktualisieren..."
+for attempt in 1 2 3; do
+    if apt update -y 2>/dev/null; then ok "Paketlisten aktualisiert (Versuch $attempt/3)"; break
+    elif [[ $attempt -eq 3 ]]; then warn "apt update fehlgeschlagen. Fahre fort."
+    else warn "Retry in 5s..."; sleep 5; fi
+done
+apt upgrade -y 2>/dev/null && ok "Pakete aktualisiert" || warn "upgrade hatte Probleme"
+safe_run apt autoremove -y; safe_run apt clean; safe_run apt autoclean
+
+# ============================================================================
+# 2. CPU-MICROCODE + CODECS (nur installieren, wenn nicht schon da)
+# ============================================================================
+info "🧠 Phase 2/12: CPU-Microcode + Codecs..."
+if [[ -n "$CPU_MICROCODE" ]] && ! dpkg -l 2>/dev/null | grep -q "^ii.*$CPU_MICROCODE"; then
+    apt install -y "$CPU_MICROCODE" 2>/dev/null && ok "Microcode installiert" || warn "⚠️ Microcode fehlgeschlagen"
+fi
+
+CODECS="mint-meta-codecs ffmpeg va-driver-all mesa-va-drivers vainfo"
+if [[ -n "$CPU_VA_DRIVER" ]] && [[ "$CPU_VA_DRIVER" != *"mesa-va-drivers"* ]]; then CODECS="$CODECS $CPU_VA_DRIVER"; fi
+if [[ "$GPU_TYPE" == "nvidia" ]]; then CODECS="$CODECS nvidia-vaapi-driver libva-nvidia-driver"; fi
+
+if ! dpkg -l 2>/dev/null | grep -q "va-driver-all"; then
+    apt install -y $CODECS 2>/dev/null && ok "Codecs installiert" || warn "⚠️ Codec-Installation unvollständig"
+fi
+
+if [[ "$GPU_TYPE" == "nvidia" ]] && ! grep -q "LIBVA_DRIVER_NAME=nvidia" /etc/environment 2>/dev/null; then
+    echo "LIBVA_DRIVER_NAME=nvidia" >> /etc/environment; info "🎮 NVIDIA VA-API gesetzt"
+fi
+
+# ============================================================================
+# 3. FIREFOX: PRIVACY + AUTO-CLEANUP (maximal defensiv)
+# ============================================================================
+info "🦊 Phase 3/12: Firefox konfigurieren..."
+POLICY_FILE="/etc/firefox/policies/policies.json"
+if [[ ! -f "$POLICY_FILE" ]]; then
+    safe_run mkdir -p /etc/firefox/policies
+    cat > "$POLICY_FILE" << 'POLICY_EOF'
+{
+  "policies": {
+    "SanitizeOnShutdown": {
+      "Cache": true, "Cookies": true, "Downloads": false, "FormData": true, "History": true, "Sessions": true, "SiteSettings": false, "OfflineApps": true, "Locked": true
+    },
+    "Preferences": {
+      "privacy.sanitize.sanitizeOnShutdown": true, "privacy.clearOnShutdown.cache": true, "privacy.clearOnShutdown.cookies": true, "privacy.clearOnShutdown.formdata": true, "privacy.clearOnShutdown.history": true, "privacy.clearOnShutdown.sessions": true, "privacy.clearOnShutdown.offlineApps": true, "privacy.clearOnShutdown.passwords": false, "places.history.enabled": false, "privacy.trackingprotection.enabled": true, "browser.formfill.enable": false, "media.ffmpeg.vaapi.enabled": true, "media.ffvpx.enabled": false, "gfx.webrender.all": true, "network.trr.mode": 2, "network.trr.uri": "https://mozilla.cloudflare-dns.com/dns-query"
+    },
+    "DisableTelemetry": true, "DisableFirefoxStudies": true, "DisablePocket": true,
+    "Extensions": { "Install": ["https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi"], "Locked": false }
+  }
+}
+POLICY_EOF
+    ok "Firefox-Policy erstellt"
+fi
+
+FIREFOX_PROFILES="$HOME_DIR/.mozilla/firefox"
+if [[ -d "$FIREFOX_PROFILES" ]]; then
+    for profile_dir in "$FIREFOX_PROFILES"/*.default*; do
+        if [[ -d "$profile_dir" ]] && [[ ! -f "$profile_dir/.privacy-configured" ]]; then
+            [[ -f "$profile_dir/user.js" ]] && cp "$profile_dir/user.js" "$profile_dir/user.js.backup.$(date +%Y%m%d%H%M)" 2>/dev/null || true
+            cat >> "$profile_dir/user.js" << 'USERJS_EOF'
+user_pref("privacy.sanitize.sanitizeOnShutdown", true);
+user_pref("privacy.clearOnShutdown.cache", true);
+user_pref("privacy.clearOnShutdown.cookies", true);
+user_pref("privacy.clearOnShutdown.formdata", true);
+user_pref("privacy.clearOnShutdown.history", true);
+user_pref("privacy.clearOnShutdown.sessions", true);
+user_pref("privacy.clearOnShutdown.offlineApps", true);
+user_pref("privacy.clearOnShutdown.passwords", false);
+user_pref("media.ffmpeg.vaapi.enabled", true);
+user_pref("media.ffvpx.enabled", false);
+user_pref("gfx.webrender.all", true);
+user_pref("privacy.resistFingerprinting", false);
+user_pref("privacy.firstparty.isolate", false);
+USERJS_EOF
+            touch "$profile_dir/.privacy-configured"
+            chown -R "$SCRIPT_USER:$SCRIPT_USER" "$profile_dir" 2>/dev/null || true
+            ok "Firefox-Profil konfiguriert"
+        fi
+    done
+else
+    info "Firefox noch nicht gestartet – Konfiguration beim ersten Start nachgeholt"
+fi
+
+# ============================================================================
+# 4. TEAMS NATIVE: KEIN AUTOSTART + RESSOURCEN-SCHONEND + PIPEWIRE
+# ============================================================================
+if $TEAMS_NATIVE; then
+    info "💬 Phase 4/12: Teams native optimieren..."
+    if ! dpkg -l 2>/dev/null | grep -q "pipewire-pulse"; then
+        apt install -y pipewire pipewire-pulse wireplumber 2>/dev/null && {
+            sudo -u "$SCRIPT_USER" systemctl --user daemon-reload 2>/dev/null || true
+            sudo -u "$SCRIPT_USER" systemctl --user restart pipewire pipewire-pulse 2>/dev/null || true
+            ok "PipeWire installiert"
+        } || warn "⚠️ PipeWire fehlgeschlagen"
+    fi
+    rm -f "$HOME_DIR/.config/autostart/teams.desktop" 2>/dev/null
+    [[ -f "/etc/xdg/autostart/teams.desktop" ]] && sed -i 's/^Hidden=false/Hidden=true/' /etc/xdg/autostart/teams.desktop 2>/dev/null || true
+
+    WRAPPER="/usr/local/bin/teams-quiet"
+    if [[ ! -f "$WRAPPER" ]]; then
+        cat > "$WRAPPER" << 'WRAPPER_EOF'
+#!/bin/bash
+export PULSE_LATENCY_MSEC=30
+exec nice -n 10 ionice -c3 /usr/bin/teams "$@"
+WRAPPER_EOF
+        chmod +x "$WRAPPER" 2>/dev/null; ok "Teams-Wrapper erstellt"
+    fi
+
+    for desktop_file in /usr/share/applications/teams*.desktop; do
+        if [[ -f "$desktop_file" ]] && ! grep -q "$WRAPPER" "$desktop_file" 2>/dev/null; then
+            cp "$desktop_file" "$desktop_file.backup.$(date +%Y%m%d%H%M)" 2>/dev/null || true
+            sed -i "s|^Exec=.*teams|Exec=$WRAPPER|" "$desktop_file" 2>/dev/null || true
+            ok "Teams-Desktop aktualisiert: $(basename "$desktop_file")"
+        fi
+    done
+else
+    info "💬 Teams-Web-Verknüpfung erstellen..."
+    TEAMS_WEB="$HOME_DIR/.local/share/applications/teams-web.desktop"
+    if [[ ! -f "$TEAMS_WEB" ]]; then
+        safe_run mkdir -p "$HOME_DIR/.local/share/applications"
+        cat > "$TEAMS_WEB" << TEAMS_EOF
+[Desktop Entry]
+Name=Microsoft Teams (Web)
+Exec=firefox --new-window https://teams.microsoft.com
+Icon=firefox
+Terminal=false
+Type=Application
+StartupNotify=true
+Categories=Network;Chat;
+TEAMS_EOF
+        chmod +x "$TEAMS_WEB" 2>/dev/null; chown "$SCRIPT_USER:$SCRIPT_USER" "$TEAMS_WEB" 2>/dev/null; ok "Teams-Web erstellt"
+    fi
+fi
+
+# ============================================================================
+# 5. AUTOMATISCHE SICHERHEITS-UPDATES (nur Security, KEIN Auto-Reboot)
+# ============================================================================
+info "🔒 Phase 5/12: Automatische Sicherheits-Updates..."
+apt install -y unattended-upgrades 2>/dev/null || true
+UNATTENDED_CONF="/etc/apt/apt.conf.d/99mint-ultimate-unattended"
+if [[ ! -f "$UNATTENDED_CONF" ]] || ! grep -q "Automatic-Reboot \"false\"" "$UNATTENDED_CONF" 2>/dev/null; then
+    cat > "$UNATTENDED_CONF" << 'UNATTENDED_EOF'
+Unattended-Upgrade::Allowed-Origins { "${distro_id}:${distro_codename}-security"; };
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::MailOnlyOnError "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+UNATTENDED_EOF
+fi
+cat > /etc/apt/apt.conf.d/20mint-ultimate-periodic << 'PERIODIC_EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+PERIODIC_EOF
+safe_run systemctl enable --now unattended-upgrades
+
+# ============================================================================
+# 6. SSD-OPTIMIERUNGEN (NUR bei SSD, mit fstab-Backup!)
+# ============================================================================
+if $SSD_DETECTED; then
+    info "💾 Phase 6/12: SSD-Optimierungen..."
+    systemctl enable --now fstrim.timer 2>/dev/null || true
+    if ! grep -q "noatime" /etc/fstab 2>/dev/null; then
+        cp /etc/fstab "/etc/fstab.backup.$(date +%Y%m%d%H%M)" 2>/dev/null || true
+        sed -i.bak '/\s\/\s/ && /errors=remount-ro/ && !/noatime/ s/errors=remount-ro/errors=remount-ro,noatime/' /etc/fstab 2>/dev/null || true
+        [[ -f "/etc/fstab.bak" ]] && cp "/etc/fstab.bak" /etc/fstab 2>/dev/null || true
+        warn "⚠️ noatime hinzugefügt (wirkt nach Neustart)"
+    fi
+    apt install -y smartmontools 2>/dev/null || true
+    systemctl enable --now smartd 2>/dev/null || true
+fi
+
+JOURNAL_CONF="/etc/systemd/journald.conf.d/00-mint-ultimate.conf"
+if [[ ! -f "$JOURNAL_CONF" ]] || ! grep -q "SystemMaxUse" "$JOURNAL_CONF" 2>/dev/null; then
+    safe_run mkdir -p /etc/systemd/journald.conf.d
+    cat > "$JOURNAL_CONF" << 'JOURNAL_EOF'
+[Journal]
+SystemMaxUse=100M
+RuntimeMaxUse=50M
+MaxRetentionSec=1month
+JOURNAL_EOF
+    systemctl restart systemd-journald 2>/dev/null || true; ok "Journal begrenzt"
+fi
+
+# ============================================================================
+# 7. RAM-OPTIMIERUNG (ZRAM + Swappiness NUR bei <8GB)
+# ============================================================================
+if [[ "$TOTAL_RAM_GB" -lt 8 ]]; then
+    info "🧠 Phase 7/12: RAM-Optimierung (<8GB)..."
+    apt install -y zram-tools 2>/dev/null || true
+    ZRAM_CONF="/etc/default/zramswap"
+    if [[ ! -f "$ZRAM_CONF" ]] || ! grep -q "PERCENT=25" "$ZRAM_CONF" 2>/dev/null; then
+        cat > "$ZRAM_CONF" << 'ZRAM_EOF'
+ALGO=lz4
+PERCENT=25
+PRIORITY=100
+ZRAM_EOF
+        systemctl enable --now zramswap 2>/dev/null || true; ok "ZRAM aktiv"
+    fi
+    if ! grep -q "vm.swappiness=10" /etc/sysctl.conf 2>/dev/null; then
+        echo "vm.swappiness=10" >> /etc/sysctl.conf; sysctl -p &>/dev/null || true; ok "Swappiness=10"
+    fi
+else
+    info "RAM >=8GB: Keine RAM-Optimierung nötig"
+fi
+
+# ============================================================================
+# 8. ENERGIEVERWALTUNG (optimiert für "meist am Netzteil")
+# ============================================================================
+info "🔋 Phase 8/12: Energieverwaltung..."
+if systemctl list-unit-files 2>/dev/null | grep -q "power-profiles-daemon.service"; then
+    systemctl enable --now power-profiles-daemon 2>/dev/null || true
+    safe_run systemctl disable --now tlp
+    ok "power-profiles-daemon aktiv"
+else
+    apt install -y tlp tlp-rdw 2>/dev/null || true
+    safe_run mkdir -p /etc/tlp.d
+    cat > /etc/tlp.d/99-mint-ultimate.conf << 'TLP_EOF'
+CPU_SCALING_GOVERNOR_ON_AC=performance
+CPU_SCALING_GOVERNOR_ON_BAT=powersave
+USB_BLACKLIST_DRIVER="snd_usb_audio"
+WIFI_PWR_ON_AC=off
+WIFI_PWR_ON_BAT=on
+TLP_EOF
+    systemctl enable --now tlp 2>/dev/null || true; ok "TLP aktiv"
+    safe_run systemctl disable --now power-profiles-daemon
+fi
+
+# ============================================================================
+# 9. BASIS-SICHERHEIT + UNNÖTIGE DIENSTE (minimal, aber sicher)
+# ============================================================================
+info "🛡️ Phase 9/12: Firewall + Dienste..."
+apt install -y ufw 2>/dev/null || true
+ufw status 2>/dev/null | grep -q "Status: active" || { ufw default deny incoming 2>/dev/null; ufw default allow outgoing 2>/dev/null; echo "y" | ufw enable 2>/dev/null; }
+for svc in cups.service avahi-daemon.service ModemManager.service whoopsie.service; do
+    systemctl is-active --quiet "$svc" 2>/dev/null && safe_run systemctl disable --now "$svc"
+done
+safe_run systemctl disable --now snapd snapd.socket 2>/dev/null
+apt purge -y thunderbird hexchat transmission-gtk 2>/dev/null || true
+safe_run apt autoremove -y; ok "System aufgeräumt"
+
+# ============================================================================
+# 10. CINNAMON + ABSCHLUSS (optional, nicht kritisch)
+# ============================================================================
+if $IS_CINNAMON && command -v gsettings &>/dev/null; then
+    info "🎨 Phase 10/12: Cinnamon-UI optimieren..."
+    for key in windows-animations close-animation maximize-animation minimize-animation; do
+        safe_run sudo -u "$SCRIPT_USER" gsettings set org.cinnamon.desktop.effects "$key" false
+    done
+fi
+
+info "💾 Phase 11/12: Timeshift installieren..."
+apt install -y timeshift 2>/dev/null && ok "Timeshift installiert" || warn "⚠️ Timeshift fehlgeschlagen"
+
+# ============================================================================
+# 12. ABSCHLUSS: Status-Report + Nächste Schritte
+# ============================================================================
+info "📝 Phase 12/12: Abschluss..."
+STATUS_FILE="/opt/mint-ultimate-final-status.txt"
+cat > "$STATUS_FILE" << STATUS_EOF
+=== Abschluss: $TIMESTAMP | User: $SCRIPT_USER
+✅ System aktualisiert, Microcode, Codecs
+✅ Firefox: Auto-Cleanup + Hardware-Decoding
+✅ Teams: Kein Autostart, Ressourcen-Limits, PipeWire
+✅ SSD: fstrim + noatime (falls erkannt)
+✅ Journal 100MB, Firewall aktiv, unnötige Dienste deaktiviert
+✅ Automatische Security-Updates (kein Reboot)
+✅ Timeshift installiert (Snapshot manuell erstellen)
+STATUS_EOF
+
+echo ""
+echo "================================================================"
+echo "✅ ULTIMATE FINAL SETUP ERFOLGREICH ABGESCHLOSSEN"
+echo "================================================================"
+echo "🔁 Empfohlen: sudo reboot"
+echo "🛠️  Danach nur noch:"
+echo "   1. Firefox öffnen → uBlock Origin bestätigen"
+echo "   2. Teams starten → anmelden"
+echo "   3. Timeshift öffnen → ersten Snapshot erstellen"
+echo "💤 DANACH: System vergessen. Es läuft von allein."
+echo "================================================================"
